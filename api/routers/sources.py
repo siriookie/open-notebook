@@ -293,13 +293,19 @@ async def create_source(
     ),
 ):
     """Create a new source with support for both JSON and multipart form data."""
+    # parse_source_form_data 已经把 multipart/form-data 解析成了统一的 SourceCreate，
+    # 并把真正的 UploadFile 单独返回。这里先拆开，后续逻辑就不用再关心请求是表单还是 JSON 兼容入口。
     source_data, upload_file = form_data
 
-    # Initialize file_path before try block so exception handlers can reference it
+    # file_path 需要先定义在 try 外层。
+    # 原因是后面多个异常分支都要负责清理临时上传文件；如果变量只在局部创建，
+    # 清理逻辑就拿不到它，容易留下磁盘垃圾文件。
     file_path = None
 
     try:
-        # Verify all specified notebooks exist (backward compatibility support)
+        # 先校验所有 notebook 是否存在，而不是等到后面关联时再失败。
+        # 这么做可以尽早返回明确的 404，避免已经上传文件、已经创建 source 记录之后
+        # 才发现 notebook 不存在，导致额外的回滚和清理工作。
         for notebook_id in source_data.notebooks or []:
             notebook = await Notebook.get(notebook_id)
             if not notebook:
@@ -307,7 +313,9 @@ async def create_source(
                     status_code=404, detail=f"Notebook {notebook_id} not found"
                 )
 
-        # Handle file upload if provided
+        # 只有 upload 类型并且真的带了文件时，才把文件落盘。
+        # 这样做是为了把“文件保存”与“后续内容处理”解耦：
+        # 后面的处理流程统一只认 file_path，不直接依赖 UploadFile 流对象。
         if upload_file and source_data.type == "upload":
             try:
                 file_path = await save_uploaded_file(upload_file)
@@ -317,24 +325,32 @@ async def create_source(
                     status_code=400, detail=f"File upload failed: {str(e)}"
                 )
 
-        # Prepare content_state for processing
+        # content_state 是后续 source_graph / process_source 命令真正消费的输入。
+        # 这里先把不同来源类型规整成统一结构，后面的处理链路就可以按一种接口工作。
         content_state: dict[str, Any] = {}
 
         if source_data.type == "link":
+            # link 类型的最小必要输入就是 URL。
+            # 在进入后台任务前就做显式校验，可以避免排队后才失败，占用 worker 资源。
             if not source_data.url:
                 raise HTTPException(
                     status_code=400, detail="URL is required for link type"
                 )
+            # content-core 在处理链接时读取的是 url 字段，所以这里按它期望的键名组装。
             content_state["url"] = source_data.url
         elif source_data.type == "upload":
-            # Use uploaded file path or provided file_path (backward compatibility)
+            # upload 类型统一转换成 file_path。
+            # 优先使用本次请求刚保存的 file_path；如果没有，则回退到兼容旧接口的 source_data.file_path。
             final_file_path = file_path or source_data.file_path
             if not final_file_path:
                 raise HTTPException(
                     status_code=400,
                     detail="File upload or file_path is required for upload type",
                 )
-            # Validate file_path is within the uploads directory to prevent LFI
+            # 再次校验最终路径必须位于上传目录内。
+            # save_uploaded_file 已经通过 generate_unique_filename 把新上传文件限制在 UPLOADS_FOLDER，
+            # 但这里还允许兼容旧 file_path 输入，所以必须做一次最终收口，
+            # 防止通过伪造路径读取/处理 uploads 目录之外的本地文件。
             uploads_resolved = Path(UPLOADS_FOLDER).resolve()
             file_resolved = Path(final_file_path).resolve()
             if not str(file_resolved).startswith(str(uploads_resolved) + os.sep):
@@ -342,21 +358,29 @@ async def create_source(
                     status_code=400,
                     detail="Invalid file path: must be within the uploads directory",
                 )
+            # 后续图流程只需要拿到文件路径即可，不需要感知上传细节。
             content_state["file_path"] = final_file_path
+            # delete_source 会被后续内容处理链路消费，用来决定处理后是否删除原始文件。
+            # 在这里显式传下去，是为了让“接口层的用户选择”进入“后台处理层”。
             content_state["delete_source"] = source_data.delete_source
         elif source_data.type == "text":
+            # text 类型的核心输入是纯文本内容，没有内容就没有后续抽取/嵌入价值，
+            # 因此直接在入口拒绝。
             if not source_data.content:
                 raise HTTPException(
                     status_code=400, detail="Content is required for text type"
                 )
+            # text 类型不需要 content-core 再从外部抓取，直接把内容传给处理链路。
             content_state["content"] = source_data.content
         else:
+            # 这里兜底防御非法 type，确保后续逻辑只在明确支持的三种来源上运行。
             raise HTTPException(
                 status_code=400,
                 detail="Invalid source type. Must be link, upload, or text",
             )
 
-        # Validate transformations exist
+        # transformation 不是“可有可无的字符串配置”，而是后续后台命令要真实加载的数据库对象。
+        # 这里先校验存在性，避免任务进入队列后运行到一半才因为 transformation 缺失而失败。
         transformation_ids = source_data.transformations or []
         for trans_id in transformation_ids:
             transformation = await Transformation.get(trans_id)
@@ -365,13 +389,18 @@ async def create_source(
                     status_code=404, detail=f"Transformation {trans_id} not found"
                 )
 
-        # Branch based on processing mode
+        # 处理模式分成异步和同步两条路径：
+        # - 异步：更适合 URL 抓取、OCR、长文嵌入等重任务，HTTP 只负责“建记录 + 入队”
+        # - 同步：保留旧行为，适合希望请求返回时就拿到完整结果的场景
         if source_data.async_processing:
-            # ASYNC PATH: Create source record first, then queue command
+            # 异步路径的核心思路是：先创建一个“占位 Source”，再把真实处理放到后台命令系统。
+            # 这样 UI 可以马上看到一条 Processing... 的来源，而不必一直卡在请求里等待。
             logger.info("Using async processing path")
 
-            # Create source record with asset - let SurrealDB generate the ID
-            # Persist asset before save so it's available for retry if processing fails
+            # 先把 asset 存进 Source 记录里，而不是等处理成功后再补。
+            # 原因有两个：
+            # 1. 如果任务失败，UI 里仍然能知道这个来源最初指向哪个 URL / 文件；
+            # 2. 重试时可以复用这个持久化的资产信息，不需要用户重新上传或重新填写。
             if source_data.type == "link":
                 source_asset = Asset(url=source_data.url)
             elif source_data.type == "upload":
@@ -379,23 +408,30 @@ async def create_source(
             else:
                 source_asset = None
 
+            # 不手动指定 id，让 SurrealDB 在 save() -> repo_create() 中生成主键。
+            # 这样可以保证 ID 分配和持久化策略统一都走领域模型层。
             source = Source(
                 title=source_data.title or "Processing...",
                 topics=[],
                 asset=source_asset,
             )
+            # save() 会把记录真正写入数据库；只有先拿到 source.id，
+            # 后面的后台命令和 notebook 关联才有稳定的目标对象可引用。
             await source.save()
 
-            # Add source to notebooks immediately so it appears in the UI
-            # The source_graph will skip adding duplicates
+            # 立刻建立 source -> notebook 的 reference 关系，而不是等后台处理结束。
+            # 这样设计是为了 UI 响应性：用户提交后来源列表马上就能出现这条记录。
+            # 后面的 source_graph 不再重复创建关系，避免重复边。
             for notebook_id in source_data.notebooks or []:
                 await source.add_to_notebook(notebook_id)
 
             try:
-                # Import command modules to ensure they're registered
+                # surreal-commands 在提交命令前需要本地 registry 已经注册对应命令。
+                # 这里显式 import 不是“为了使用变量”，而是为了触发命令装饰器注册。
                 import commands.source_commands  # noqa: F401
 
-                # Submit command for background processing
+                # 把 HTTP 层的请求参数收敛成后台命令专用输入模型。
+                # 这样命令层拿到的就是稳定、可序列化的结构，不需要再依赖 FastAPI 请求对象。
                 command_input = SourceProcessingInput(
                     source_id=str(source.id),
                     content_state=content_state,
@@ -404,6 +440,9 @@ async def create_source(
                     embed=source_data.embed,
                 )
 
+                # 真正把任务提交给 surreal-commands。
+                # CommandService.submit_command_job 内部最终会调用 submit_command(app_name, command_name, args)，
+                # 返回的 command_id 是后续状态轮询和 source.command 关联的关键。
                 command_id = await CommandService.submit_command_job(
                     "open_notebook",  # app name
                     "process_source",  # command name
@@ -412,12 +451,16 @@ async def create_source(
 
                 logger.info(f"Submitted async processing command: {command_id}")
 
-                # Update source with command reference immediately
-                # command_id already includes 'command:' prefix
+                # 立刻把 command_id 回写到 source.command。
+                # 原因是前端来源列表会根据 command/status 轮询处理状态；
+                # 如果不马上写回，SourceCard 就无法知道这条来源对应哪个后台任务。
+                # ensure_record_id 会把字符串规范成 SurrealDB RecordID，符合 Source._prepare_save_data 的预期。
                 source.command = ensure_record_id(command_id)
                 await source.save()
 
-                # Return source with command info
+                # 异步模式下故意返回“未完成态”的 SourceResponse：
+                # asset/full_text/embedded 这些字段以后台任务结果为准，当前只返回最小可展示信息，
+                # 让前端进入“已入队/处理中”的状态机。
                 return SourceResponse(
                     id=source.id or "",
                     title=source.title,
@@ -435,12 +478,13 @@ async def create_source(
 
             except Exception as e:
                 logger.error(f"Failed to submit async processing command: {e}")
-                # Clean up source record on command submission failure
+                # 如果命令提交失败，前面创建的 Source 就会变成“永远不会被处理的孤儿记录”。
+                # 因此这里要主动删除，保持“数据库中的 source 都有可达处理路径”这个一致性。
                 try:
                     await source.delete()
                 except Exception:
                     pass
-                # Clean up uploaded file if we created it
+                # 对于本次请求新落盘的文件，也要一并删除，避免数据库没记录但磁盘残留文件。
                 if file_path and upload_file:
                     try:
                         os.unlink(file_path)
@@ -451,26 +495,27 @@ async def create_source(
                 )
 
         else:
-            # SYNC PATH: Execute synchronously using execute_command_sync
+            # 同步路径保留的是“请求完成时就拿到处理结果”的旧语义。
+            # 它依然复用同一个 process_source 命令，只是改为当前请求线程等待结果返回。
             logger.info("Using sync processing path")
 
             try:
-                # Import command modules to ensure they're registered
+                # 和异步路径一样，先确保命令已注册到 surreal-commands 的本地 registry。
                 import commands.source_commands  # noqa: F401
 
-                # Create source record - let SurrealDB generate the ID
+                # 同样先创建 Source 记录，因为 process_source 命令是“更新既有 source”，
+                # 它要求传入 source_id，而不是帮你创建新 source。
                 source = Source(
                     title=source_data.title or "Processing...",
                     topics=[],
                 )
                 await source.save()
 
-                # Add source to notebooks immediately so it appears in the UI
-                # The source_graph will skip adding duplicates
+                # 同步路径也立刻建立 notebook 关联，保持与异步路径一致的数据可见性和行为。
                 for notebook_id in source_data.notebooks or []:
                     await source.add_to_notebook(notebook_id)
 
-                # Execute command synchronously
+                # 这里仍然复用统一的 SourceProcessingInput，避免同步/异步两套处理参数各自演化。
                 command_input = SourceProcessingInput(
                     source_id=str(source.id),
                     content_state=content_state,
@@ -479,9 +524,10 @@ async def create_source(
                     embed=source_data.embed,
                 )
 
-                # Run in thread pool to avoid blocking the event loop
-                # execute_command_sync uses asyncio.run() internally which can't
-                # be called from an already-running event loop (FastAPI)
+                # execute_command_sync 内部会调用 asyncio.run()。
+                # FastAPI 当前已经处在运行中的事件循环里，不能直接在协程中套 asyncio.run()，
+                # 所以必须放进线程池，通过 asyncio.to_thread 隔离执行环境。
+                # 这一步不是性能优化，而是为了避免 event loop 嵌套报错。
                 result = await asyncio.to_thread(
                     execute_command_sync,
                     "open_notebook",  # app name
@@ -492,12 +538,13 @@ async def create_source(
 
                 if not result.is_success():
                     logger.error(f"Sync processing failed: {result.error_message}")
-                    # Clean up source record
+                    # 同步失败时，这条 source 已经没有继续补救的后台任务会来处理它，
+                    # 所以要立即删除，避免返回给用户一条“假存在”的来源记录。
                     try:
                         await source.delete()
                     except Exception:
                         pass
-                    # Clean up uploaded file if we created it
+                    # 同步失败且文件是本次请求新上传的，也一并清理，保持 DB 和文件系统一致。
                     if file_path and upload_file:
                         try:
                             os.unlink(file_path)
@@ -508,7 +555,9 @@ async def create_source(
                         detail=f"Processing failed: {result.error_message}",
                     )
 
-                # Get the processed source
+                # 同步命令成功后，再从数据库重新读取 source。
+                # 这么做不是多余查询，而是因为真正的内容抽取、标题回填、asset/full_text 更新、
+                # 甚至 embedding 提交，都是命令/graph 在另一层写进去的；内存中的 source 对象并不可靠。
                 if not source.id:
                     raise HTTPException(status_code=500, detail="Source ID is missing")
                 processed_source = await Source.get(source.id)
@@ -517,6 +566,8 @@ async def create_source(
                         status_code=500, detail="Processed source not found"
                     )
 
+                # 嵌入块数量需要单独查询 source_embedding 表。
+                # SourceList 里只有 embedded 布尔信息；详情响应这里补充真实 chunk 数，供 UI 展示。
                 embedded_chunks = await processed_source.get_embedded_chunks()
                 return SourceResponse(
                     id=processed_source.id or "",
@@ -542,7 +593,8 @@ async def create_source(
 
             except Exception as e:
                 logger.error(f"Sync processing failed: {e}")
-                # Clean up uploaded file if we created it
+                # 同步路径里任意未处理异常都要尽量回收本次新上传的文件，
+                # 因为请求失败意味着用户侧通常会重试，残留文件没有继续保留的价值。
                 if file_path and upload_file:
                     try:
                         os.unlink(file_path)
@@ -551,7 +603,9 @@ async def create_source(
                 raise
 
     except HTTPException:
-        # Clean up uploaded file on HTTP exceptions if we created it
+        # 对“主动抛出的业务异常”做统一文件清理。
+        # 这里和上面的局部清理并不冲突：局部分支主要处理已知失败点，
+        # 外层则是兜底，防止遗漏某个异常出口。
         if file_path and upload_file:
             try:
                 os.unlink(file_path)
@@ -559,7 +613,8 @@ async def create_source(
                 pass
         raise
     except InvalidInputError as e:
-        # Clean up uploaded file on validation errors if we created it
+        # 领域层抛出的输入错误统一转成 400，避免把用户输入问题包装成 500。
+        # 同时也保持上传文件清理策略一致。
         if file_path and upload_file:
             try:
                 os.unlink(file_path)
@@ -568,7 +623,8 @@ async def create_source(
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         logger.error(f"Error creating source: {str(e)}")
-        # Clean up uploaded file on unexpected errors if we created it
+        # 兜底异常统一视为服务端错误，并在返回 500 前尽可能清理临时文件。
+        # 这样即使后续某个新分支忘了做清理，也不会轻易积累脏数据和脏文件。
         if file_path and upload_file:
             try:
                 os.unlink(file_path)
