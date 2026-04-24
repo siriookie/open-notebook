@@ -246,37 +246,56 @@ async def run_transformation_command(
     - Uses exponential-jitter backoff (1-60s)
     - Does NOT retry permanent failures (ValueError for validation errors)
     """
+    # 记录整条 transformation 命令的起始时间，用于最终返回 processing_time。
+    # 这里统计的是“加载 source + 调 LLM + 创建 insight”整条后台链路的总耗时。
     start_time = time.time()
 
     try:
+        # 先记录入口日志，方便把这次任务和 source / transformation 关联起来。
+        # 由于这是后台命令，排查时通常拿不到原始 HTTP 上下文，入口日志很关键。
         logger.info(
             f"Running transformation {input_data.transformation_id} "
             f"on source {input_data.source_id}"
         )
 
-        # Load source
+        # 先加载 source。
+        # run_transformation 命令不是“创建 source 后顺手做一点处理”，而是面向已存在 source
+        # 的独立后台操作，所以 source_id 必须能在数据库里查到。
         source = await Source.get(input_data.source_id)
         if not source:
             raise ValueError(f"Source '{input_data.source_id}' not found")
 
-        # Load transformation
+        # 再加载 transformation。
+        # 这里要拿到的不是一个字符串 ID，而是真正的 Transformation 对象，
+        # 因为后面的 graph 需要读取它的 title / prompt 等字段来生成 insight。
         transformation = await Transformation.get(input_data.transformation_id)
         if not transformation:
             raise ValueError(
                 f"Transformation '{input_data.transformation_id}' not found"
             )
 
-        # Run transformation graph (includes LLM call + insight creation)
+        # 调用 transformation graph 执行真正的转换流程。
+        # 这一步包含：
+        # 1. 读取 source.full_text 作为输入文本（如果没显式传 input_text）
+        # 2. 用 transformation.prompt 构造系统提示词
+        # 3. 调用 LLM 生成输出
+        # 4. 通过 source.add_insight() 把结果作为 insight 异步创建
+        # 这里之所以复用 graph，而不是在命令里手写一遍调用 LLM 的逻辑，
+        # 是为了把 transformation 的核心业务规则统一收敛到一处维护。
         await transform_graph.ainvoke(
             input=dict(source=source, transformation=transformation)
         )
 
+        # 在成功出口统一计算总耗时。
         processing_time = time.time() - start_time
         logger.info(
             f"Successfully ran transformation {input_data.transformation_id} "
             f"on source {input_data.source_id} in {processing_time:.2f}s"
         )
 
+        # 返回的是命令执行摘要，而不是 insight 内容本身。
+        # 原因是当前命令的职责是“触发并完成 transformation”，
+        # 真正的结果会以 SourceInsight 的形式写入系统，供后续查询。
         return RunTransformationOutput(
             success=True,
             source_id=input_data.source_id,
@@ -285,7 +304,8 @@ async def run_transformation_command(
         )
 
     except ValueError as e:
-        # Validation errors are permanent failures - don't retry
+        # ValueError 代表永久性失败，例如 source 或 transformation 不存在。
+        # 这类错误重试没有意义，所以直接返回失败结果，不交给重试框架。
         processing_time = time.time() - start_time
         logger.error(
             f"Failed to run transformation {input_data.transformation_id} "
@@ -299,7 +319,8 @@ async def run_transformation_command(
             error_message=str(e),
         )
     except Exception as e:
-        # Transient failure - will be retried (surreal-commands logs final failure)
+        # 其他异常统一视为暂时性失败，继续 raise 给 surreal-commands 的 retry 策略处理。
+        # 典型场景是模型调用超时、网络波动、上游服务瞬时不可用等。
         logger.debug(
             f"Transient error running transformation {input_data.transformation_id} "
             f"on source {input_data.source_id}: {e}"

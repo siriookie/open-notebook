@@ -129,26 +129,37 @@ async def generate_embeddings(
         ValueError: If no embedding model is configured
         RuntimeError: If embedding generation fails
     """
+    # 空列表直接返回空结果。
+    # 这样调用方不需要额外在外面做一次“if texts”防守，也能避免后面无意义地加载模型。
     if not texts:
         return []
 
-    # Lazy import to avoid circular dependency
+    # 延迟导入 model_manager，避免 utils.embedding 和模型层之间出现循环依赖。
+    # 只有真正需要发起 embedding 请求时，才把模型管理器拉进来。
     from open_notebook.ai.models import model_manager
 
+    # 读取当前配置好的 embedding 模型。
+    # 这里统一通过 model_manager 获取，而不是让每个调用点自己创建模型实例，
+    # 这样整个应用的 embedding 行为才能保持一致。
     embedding_model = await model_manager.get_embedding_model()
     if not embedding_model:
         raise ValueError(
             "No embedding model configured. Please configure one in the Models section."
         )
 
+    # 取模型名主要用于日志。
+    # 这样批量 embedding 失败时，日志里能明确指出到底是哪一个模型在报错。
     model_name = getattr(embedding_model, "model_name", "unknown")
 
-    # Log text sizes for debugging
+    # 准备一组用于调试的输入规模指标。
+    # 这里故意做成懒计算，是因为 token_count() 对大批文本并不便宜；
+    # 只有当前日志级别真的需要输出这些信息时，才去计算。
     metrics: tuple[int, int, int, int] | None = None
 
     def _get_size_metrics() -> tuple[int, int, int, int]:
         nonlocal metrics
         if metrics is None:
+            # 同时统计 token 和字符规模，方便判断失败是“文本太多”还是“文本太长”。
             token_sizes = [token_count(t) for t in texts]
             metrics = (
                 min(token_sizes),
@@ -158,6 +169,8 @@ async def generate_embeddings(
             )
         return metrics
 
+    # 用 lazy logging 记录输入规模。
+    # 这样在 debug 级别关闭时，不会白白计算 token 统计。
     logger.opt(lazy=True).debug(
         "Generating embeddings for {} texts "
         "(tokens: min={}, max={}, total={}; chars: total={})",
@@ -168,29 +181,49 @@ async def generate_embeddings(
         lambda: _get_size_metrics()[3],
     )
 
+    # all_embeddings 按输入顺序累计所有批次的结果。
+    # 这里顺序很重要：调用方默认依赖“第 N 条文本对应第 N 个 embedding”。
     all_embeddings: List[List[float]] = []
+
+    # 先根据全局批大小算出总批次数。
+    # 之所以分批，是为了避免一次性请求太大，撞上 provider 的 payload / 并发限制。
     total_batches = (len(texts) + EMBEDDING_BATCH_SIZE - 1) // EMBEDDING_BATCH_SIZE
 
+    # 逐批处理输入文本。
+    # 当前实现选择串行处理批次，而不是所有批次一起并发发出去，
+    # 目的是把请求规模和失败面控制得更稳。
     for batch_idx in range(total_batches):
         start = batch_idx * EMBEDDING_BATCH_SIZE
         end = start + EMBEDDING_BATCH_SIZE
         batch = texts[start:end]
 
+        # 每个批次都带有限次重试。
+        # 这类请求常见的失败原因是瞬时网络抖动、限流、provider 短暂不可用，
+        # 所以没必要第一次失败就立刻让整批任务报废。
         for attempt in range(1, EMBEDDING_MAX_RETRIES + 1):
             try:
+                # 真正调用 embedding 模型的批量接口。
+                # 当前假设 embedding_model.aembed(batch) 返回的向量顺序与输入顺序一致。
                 batch_embeddings = await embedding_model.aembed(batch)
                 all_embeddings.extend(batch_embeddings)
+                # 当前批次成功后，退出重试循环，继续处理下一批。
                 break
             except Exception as e:
+                # command_id 只是日志上下文，不参与模型调用本身。
+                # 这样在后台命令链里出错时，可以把具体失败和 command 记录关联起来。
                 cmd_context = f" (command: {command_id})" if command_id else ""
                 if attempt < EMBEDDING_MAX_RETRIES:
+                    # 还没到最后一次时，记录失败并等待后重试。
                     logger.debug(
                         f"Embedding batch {batch_idx + 1}/{total_batches} "
                         f"attempt {attempt}/{EMBEDDING_MAX_RETRIES} failed "
                         f"using model '{model_name}'{cmd_context}: {e}. Retrying..."
                     )
+                    # 固定延迟后重试，避免瞬时连续重放把 provider 压得更紧。
                     await asyncio.sleep(EMBEDDING_RETRY_DELAY)
                 else:
+                    # 到最后一次仍失败时，不再吞错，直接把这批失败升级成 RuntimeError。
+                    # 这样调用方能明确知道是 embedding 流程失败，而不是得到一份不完整结果。
                     logger.debug(
                         f"Embedding batch {batch_idx + 1}/{total_batches} "
                         f"failed after {EMBEDDING_MAX_RETRIES} attempts "
@@ -202,6 +235,7 @@ async def generate_embeddings(
                         f"{len(batch)} texts): {e}"
                     ) from e
 
+    # 所有批次成功后，记录最终生成的 embedding 数量和批次数。
     logger.debug(f"Generated {len(all_embeddings)} embeddings in {total_batches} batch(es)")
     return all_embeddings
 

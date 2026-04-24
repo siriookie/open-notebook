@@ -144,28 +144,58 @@ async def content_process(state: SourceState) -> dict:
 
 
 async def save_source(state: SourceState) -> dict:
+    # content_process 已经把原始输入转成了统一的提取结果；
+    # 这里不再重复做抽取，只消费前一节点产出的标准化状态并负责持久化。
     content_state = state["content_state"]
 
-    # Get existing source using the provided source_id
+    # 这里必须按 source_id 取回“已经存在”的 Source，而不是新建一个：
+    # 1. 上游流程/接口已经提前创建了 Source 记录，并把它的 id 放进 graph state；
+    # 2. 这个函数的职责是把抽取结果写回原记录，保持同一个 source 身份不变；
+    # 3. Source.get() 最终会查询数据库中的现有记录，拿不到就抛错，这样能尽早暴露
+    #    “状态里的 source_id 无效”这种真正的数据一致性问题。
     source = await Source.get(state["source_id"])
     if not source:
         raise ValueError(f"Source with ID {state['source_id']} not found")
 
-    # Update the source with processed content
+    # 用抽取后的定位信息回填 asset。
+    # 这里同时保存 url 和 file_path，是因为 Source.asset 本身就承担“来源定位”的职责：
+    # 无论内容是来自网页还是上传文件，后续代码都可以从同一字段读取来源元数据，
+    # 不需要分别追踪不同输入通道的临时参数。
     source.asset = Asset(url=content_state.url, file_path=content_state.file_path)
+
+    # 把抽取出的正文写入 full_text。
+    # 后面的 transformation、聊天上下文和向量化都以 Source.full_text 为输入，
+    # 所以必须先把最新文本持久化到 Source 上，而不是只留在 graph 的临时 state 里。
     source.full_text = content_state.content
 
-    # Preserve user-set title; only overwrite placeholder or empty titles
+    # 只在标题为空，或仍是占位值 "Processing..." 时，才用抽取出的标题覆盖。
+    # 这样做是为了保护用户已经手动改过的标题，避免一次内容重处理把用户命名冲掉。
+    # 这个行为不是猜测：tests/test_graphs.py 里有专门测试覆盖了
+    # “自定义标题保留、占位标题可替换、空标题可补全”这几种情况。
     if content_state.title and (not source.title or source.title == "Processing..."):
         source.title = content_state.title
 
+    # 先保存 Source，再决定是否提交向量化任务。
+    # 原因是 Source.save() 负责把当前对象状态真正写进数据库；而 Source.vectorize()
+    # 不做内联 embedding，它只是提交一个后台 embed_source 命令，命令参数只有 source_id。
+    # 因此必须保证数据库里已经有最新的 full_text / asset / title，后台任务按 source_id
+    # 读取时才能看到这次处理后的内容，而不是旧数据。
     await source.save()
 
-    # NOTE: Notebook associations are created by the API immediately for UI responsiveness
-    # No need to create them here to avoid duplicate edges
+    # Notebook 关联关系不在这里补建。
+    # 当前文件里的约定很明确：关联边由 API 层更早创建，用来提升界面响应速度；
+    # 如果这里再建一次，就会让“保存内容”和“建立 notebook 关联”两个职责重叠，
+    # 还可能产生重复关系。
 
     if state["embed"]:
+        # 只有显式要求 embed 时，才提交向量化后台任务。
+        # 这是把“保存 source”和“是否为检索建立向量索引”解耦：有些调用方只需要保存文本，
+        # 不一定希望立刻触发额外的异步作业。
         if source.full_text and source.full_text.strip():
+            # 这里再次检查文本非空，不依赖调用方口头保证。
+            # 直接原因是 Source.vectorize() 自身就要求 full_text 非空并会在空文本时报错；
+            # 在 graph 节点里先守住这个前提，可以把“跳过 embedding”记录成 warning，
+            # 而不是把整个 save_source 流程变成失败。
             logger.debug("Embedding content for vector search")
             await source.vectorize()
         else:
@@ -173,6 +203,7 @@ async def save_source(state: SourceState) -> dict:
                 f"Source {source.id} has no text content to embed, skipping vectorization"
             )
 
+    # 返回更新后的 source，供后续条件边和 transformation 节点继续复用同一个对象。
     return {"source": source}
 
 

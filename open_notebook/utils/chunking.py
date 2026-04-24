@@ -291,27 +291,36 @@ def _calculate_markdown_score(text: str) -> float:
 
 def detect_content_type(text: str, file_path: Optional[str] = None) -> ContentType:
     """
-    Detect content type using file extension (primary) and heuristics (fallback).
+    使用文件扩展名（主判断）和内容启发式规则（兜底）来识别内容类型。
 
-    Strategy:
-    1. If file extension is available and recognized, use it as primary
-    2. If no extension or generic extension (.txt), use heuristics
-    3. Heuristics can override extension only with very high confidence
+    策略：
+    1. 如果文件扩展名存在且能识别，优先使用扩展名结果
+    2. 如果没有扩展名，或扩展名无法提供有效判断，则使用内容启发式规则
+    3. 只有当启发式判断置信度非常高时，才允许它覆盖扩展名给出的 plain 结果
 
     Args:
-        text: The text content
-        file_path: Optional file path for extension-based detection
+        text: 要分析的文本内容
+        file_path: 可选的文件路径，用于基于扩展名进行检测
 
     Returns:
-        Detected ContentType
+        检测得到的 ContentType
     """
-    # Try extension-based detection first
+    # 先尝试基于扩展名判断内容类型。
+    # 这样做的原因是：扩展名判断成本最低，而且对 .html / .md 这类明确后缀通常已经足够可靠。
+    # 但它也不是绝对可信，所以这里只把它当“主判断”，不是唯一判断。
     extension_type = detect_content_type_from_extension(file_path)
 
-    # Get heuristic-based detection
+    # 再基于文本内容本身做启发式判断，并拿到置信度。
+    # 这一步会分析文本像不像 HTML / Markdown / plain text，
+    # 用来弥补“没有扩展名”或“扩展名过于泛化”的情况。
     heuristic_type, confidence = detect_content_type_from_heuristics(text)
 
-    # If no extension or generic extension, use heuristics
+    # 如果扩展名完全帮不上忙，就直接采用启发式结果。
+    # 当前实现里 extension_type 为 None 代表：
+    # - 没传 file_path
+    # - 路径没有后缀
+    # - 后缀不在已知映射表里
+    # 这时再坚持扩展名优先就没有意义了。
     if extension_type is None:
         logger.debug(
             f"No file extension, using heuristics: {heuristic_type.value} "
@@ -319,7 +328,11 @@ def detect_content_type(text: str, file_path: Optional[str] = None) -> ContentTy
         )
         return heuristic_type
 
-    # If extension suggests plain text but heuristics are very confident, override
+    # 如果扩展名只给出一个比较保守的 plain 结果，而内容启发式又非常有把握，
+    # 就允许启发式覆盖扩展名。
+    # 这里只允许覆盖 plain，而不轻易覆盖 html / markdown，
+    # 说明当前策略更偏向“修正过于泛化的扩展名”，而不是全面推翻文件后缀判断。
+    # 典型场景是：文件后缀是 .txt，但里面其实是成段的 Markdown 或 HTML 内容。
     if extension_type == ContentType.PLAIN and confidence >= HIGH_CONFIDENCE_THRESHOLD:
         logger.debug(
             f"Extension suggests plain, but heuristics override with "
@@ -327,7 +340,8 @@ def detect_content_type(text: str, file_path: Optional[str] = None) -> ContentTy
         )
         return heuristic_type
 
-    # Otherwise trust the extension
+    # 除了上面那种“plain 被高置信度纠正”的情况，其他场景都信任扩展名。
+    # 这体现了当前函数的整体取舍：扩展名优先，启发式兜底，只在非常明确时才纠偏。
     logger.debug(f"Using extension-based content type: {extension_type.value}")
     return extension_type
 
@@ -391,58 +405,80 @@ def chunk_text(
     file_path: Optional[str] = None,
 ) -> List[str]:
     """
-    Split text into chunks using appropriate splitter for content type.
+    根据内容类型，使用对应的 splitter 将文本切分成多个 chunks。
 
     Args:
-        text: The text to chunk
-        content_type: Optional explicit content type (auto-detected if not provided)
-        file_path: Optional file path for content type detection
+        text: 需要切分的文本
+        content_type: 可选的显式内容类型；如果不传，会自动检测
+        file_path: 可选的文件路径，用于辅助内容类型检测
 
     Returns:
-        List of text chunks, each approximately <= CHUNK_SIZE tokens
+        文本 chunk 列表；每个 chunk 的大小大致不超过 CHUNK_SIZE tokens
     """
+    # 空文本或全空白文本直接返回空列表。
+    # 这里尽早返回，是为了避免后面做 token 统计、类型检测和 splitter 初始化这些无意义工作。
     if not text or not text.strip():
         return []
 
-    # Short text doesn't need chunking
+    # 先计算整段文本的 token 数。
+    # 后面的“是否需要切块”判断依赖的不是字符数，而是更接近 embedding 模型约束的 token 数。
     text_tokens = token_count(text)
+
+    # 短文本不需要切块，直接作为一个整体返回。
+    # 这样做能保留最完整的上下文，避免把本来就很短的内容切碎，反而损失语义完整性。
     if text_tokens <= CHUNK_SIZE:
         return [text]
 
-    # Detect content type if not provided
+    # 如果调用方没有显式给出内容类型，就在这里自动检测。
+    # 之所以延后到这里才检测，是因为短文本已经直接返回了，没必要为它们额外做类型识别。
     if content_type is None:
         content_type = detect_content_type(text, file_path)
 
+    # 记录当前使用的切块策略，方便后续排查“为什么某段文本被按某种方式切开”。
     logger.debug(f"Chunking text with content type: {content_type.value}")
 
-    # Select appropriate splitter
+    # 根据内容类型选择不同的 splitter。
+    # 这里的核心思路不是“所有文本都用同一种固定规则切”，而是尽量利用原文本的结构信息：
+    # - HTML 按标题层级切
+    # - Markdown 按标题层级切
+    # - plain text 用递归字符切分
     if content_type == ContentType.HTML:
+        # HTML 文本优先按 h1 / h2 / h3 这类结构边界切分。
+        # 这样切出来的 chunk 更接近页面的语义段落，而不是机械按长度截断。
         splitter = _get_html_splitter()
-        # HTML splitter returns Document objects
+        # HTML splitter 返回的是 Document 对象，而不是纯字符串。
+        # 所以这里要把 page_content 提取出来，统一成字符串列表。
         docs = splitter.split_text(text)
         chunks = [
             doc.page_content if hasattr(doc, "page_content") else str(doc)
             for doc in docs
         ]
     elif content_type == ContentType.MARKDOWN:
+        # Markdown 文本优先按 # / ## / ### 标题结构切分。
+        # 这样能尽量保留 markdown 原有层级，对后续检索和问答通常更友好。
         splitter = _get_markdown_splitter()
-        # Markdown splitter returns Document objects
+        # Markdown splitter 同样返回 Document 对象，因此也要统一抽出 page_content。
         docs = splitter.split_text(text)
         chunks = [
             doc.page_content if hasattr(doc, "page_content") else str(doc)
             for doc in docs
         ]
     else:
-        # Plain text - use recursive splitter directly
+        # 普通文本没有稳定的结构标签可依赖，所以直接用递归字符切分器。
+        # 它会按段落、换行、标点、空格等分隔符逐层尝试，尽量找到自然边界。
         splitter = _get_plain_splitter()
         chunks = splitter.split_text(text)
 
-    # Apply secondary chunking if needed (for HTML/Markdown that may produce large chunks)
+    # 对 HTML / Markdown 结果再做一次二次切块。
+    # 原因是按标题切出来的块虽然结构更自然，但有可能仍然过大；
+    # 二次切块负责把这些超长块再压回到 CHUNK_SIZE 约束内。
     if content_type in (ContentType.HTML, ContentType.MARKDOWN):
         chunks = _apply_secondary_chunking(chunks)
 
-    # Filter out empty chunks
+    # 清理空 chunk 和纯空白 chunk。
+    # 这是为了避免后续 embedding 阶段收到没有内容的块，造成无意义向量或额外错误处理。
     chunks = [c.strip() for c in chunks if c and c.strip()]
 
+    # 记录最终切块结果，便于观察切块前后的规模变化。
     logger.debug(f"Created {len(chunks)} chunks from {text_tokens} tokens")
     return chunks

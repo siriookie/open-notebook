@@ -336,36 +336,52 @@ async def embed_source_command(input_data: EmbedSourceInput) -> EmbedSourceOutpu
     - Uses exponential-jitter backoff (1-60s)
     - Does NOT retry permanent failures (ValueError for validation errors)
     """
+    # 记录整条后台命令的起始时间，用于最终返回 processing_time。
+    # 这里统计的是从加载 source 到 embeddings 写入完成的总耗时，而不是单次模型调用耗时。
     start_time = time.time()
 
     try:
+        # 先打入口日志，方便后面把这次 embedding 任务和 source_id / command_id 对上。
         logger.info(f"Starting embedding for source: {input_data.source_id}")
 
-        # 1. Load source
+        # 1. 从数据库加载 source，而不是直接相信调用方传来的 source_id 一定有效。
+        # 这样既能验证 source 是否存在，也能拿到数据库里最新的 full_text / asset。
         source = await Source.get(input_data.source_id)
         if not source:
             raise ValueError(f"Source '{input_data.source_id}' not found")
 
+        # 没有非空文本时直接失败。
+        # 原因不是“效果可能不好”，而是后续切块和 embedding 根本没有输入对象。
+        # 这类错误属于永久性业务错误，重试不会自动变好。
         if not source.full_text or not source.full_text.strip():
             raise ValueError(f"Source '{input_data.source_id}' has no text to embed")
 
-        # 2. DELETE existing embeddings (idempotency)
+        # 2. 先删掉这个 source 现有的所有 chunk embeddings。
+        # 这里走“整体重建”而不是增量更新，目的是保证命令幂等：
+        # 同一个 source 重跑多次，最终 source_embedding 集合保持一致，
+        # 也避免旧文本的 chunks 和新文本的 chunks 混在一起。
         logger.debug(f"Deleting existing embeddings for source {input_data.source_id}")
         await repo_query(
             "DELETE source_embedding WHERE source = $source_id",
             {"source_id": ensure_record_id(input_data.source_id)},
         )
 
-        # 3. Detect content type from file path if available
+        # 3. 先判断内容类型，再决定如何切块。
+        # 这里的目标不是展示 MIME，而是给 chunk_text() 选择更合适的 splitter：
+        # HTML / Markdown / plain text 会用不同规则，尽量保留结构边界。
+        # file_path 只是辅助线索；真正判断时也会结合文本启发式规则。
         file_path = source.asset.file_path if source.asset else None
         content_type = detect_content_type(source.full_text, file_path)
         logger.debug(f"Detected content type: {content_type.value}")
 
-        # 4. Chunk text using appropriate splitter
+        # 4. 按内容类型切块。
+        # 这样做不是简单按长度硬切，而是尽量在标题、段落等自然边界断开，
+        # 让每个 chunk 既不太大，又尽量保留局部语义完整性。
         chunks = chunk_text(source.full_text, content_type=content_type)
         total_chunks = len(chunks)
 
-        # Log chunk statistics for debugging
+        # 记录 chunk 数量和长度分布，方便排查“某份 source 为什么被切得过碎 / 过大”。
+        # embedding 质量和切块质量强相关，这组日志对调 chunking 策略很重要。
         chunk_sizes = [len(c) for c in chunks]
         logger.info(
             f"Created {total_chunks} chunks for source {input_data.source_id} "
@@ -374,22 +390,35 @@ async def embed_source_command(input_data: EmbedSourceInput) -> EmbedSourceOutpu
             f"avg={sum(chunk_sizes)//len(chunk_sizes) if chunk_sizes else 0} chars)"
         )
 
+        # 如果切块结果为空，直接视为失败。
+        # 不默默成功返回 0，是为了让调用链明确知道“这份文本无法形成可嵌入单元”。
         if total_chunks == 0:
             raise ValueError("No chunks created after splitting text")
 
-        # 5. Generate embeddings for all chunks in batches
+        # 5. 为所有 chunks 生成 embeddings。
+        # generate_embeddings() 内部负责批量调用 embedding 模型；
+        # 当前命令层只负责传入按顺序排列的文本列表，并接收同顺序的向量结果。
+        # command_id 透传下去，是为了让更底层日志能和当前后台命令关联起来。
         cmd_id = get_command_id(input_data)
         logger.debug(f"Generating embeddings for {total_chunks} chunks")
         embeddings = await generate_embeddings(chunks, command_id=cmd_id)
 
-        # Verify we got embeddings for all chunks
+        # 校验返回的 embedding 数量必须和 chunk 数量一一对应。
+        # 后面入库时依赖“第 N 个 chunk 对应第 N 个 embedding”；
+        # 如果数量不一致，继续往下写只会把数据顺序搞乱。
         if len(embeddings) != len(chunks):
             raise ValueError(
                 f"Embedding count mismatch: got {len(embeddings)} embeddings "
                 f"for {len(chunks)} chunks"
             )
 
-        # 6. Bulk INSERT source_embedding records
+        # 6. 先把待写入的 source_embedding 记录在内存里组装好。
+        # 每条记录都保存：
+        # - source：属于哪份 source
+        # - order：原始 chunk 顺序
+        # - content：chunk 文本本身
+        # - embedding：对应向量
+        # 保留 order 很关键，因为后续如果要重建上下文或调试召回结果，需要知道块的原始顺序。
         records = [
             {
                 "source": ensure_record_id(input_data.source_id),
@@ -400,15 +429,21 @@ async def embed_source_command(input_data: EmbedSourceInput) -> EmbedSourceOutpu
             for idx, (chunk, embedding) in enumerate(zip(chunks, embeddings))
         ]
 
+        # 一次性批量插入，而不是逐条 save。
+        # source 通常会拆成多条 chunk，批量写入可以减少数据库往返，
+        # 也让“整份 source 的 embedding 集合”更接近一次性提交。
         logger.debug(f"Inserting {len(records)} source_embedding records")
         await repo_insert("source_embedding", records)
 
+        # 统一在成功出口计算总耗时并记录结果。
         processing_time = time.time() - start_time
         logger.info(
             f"Successfully embedded source {input_data.source_id}: "
             f"{total_chunks} chunks in {processing_time:.2f}s"
         )
 
+        # 返回的是任务摘要，而不是具体 embeddings。
+        # 调用方真正关心的是是否成功、生成了多少块、耗时多久。
         return EmbedSourceOutput(
             success=True,
             source_id=input_data.source_id,
@@ -417,7 +452,8 @@ async def embed_source_command(input_data: EmbedSourceInput) -> EmbedSourceOutpu
         )
 
     except ValueError as e:
-        # Permanent failure - don't retry
+        # ValueError 代表永久性失败：source 不存在、没文本、切块为空、数量不一致等。
+        # 这类问题不是“稍后重试网络就好了”，所以直接返回失败结果，不交给重试框架。
         processing_time = time.time() - start_time
         cmd_id = get_command_id(input_data)
         logger.error(
@@ -431,7 +467,8 @@ async def embed_source_command(input_data: EmbedSourceInput) -> EmbedSourceOutpu
             error_message=str(e),
         )
     except Exception as e:
-        # Transient failure - will be retried (surreal-commands logs final failure)
+        # 其余异常统一当作暂时性失败，让 surreal-commands 的 retry 策略接管。
+        # 这里故意继续 raise，是为了保留“可重试”的语义，而不是过早固化为最终失败。
         cmd_id = get_command_id(input_data)
         logger.debug(
             f"Transient error embedding source {input_data.source_id} "

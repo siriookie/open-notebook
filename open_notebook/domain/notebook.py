@@ -410,46 +410,72 @@ class Source(ObjectModel):
 
     async def vectorize(self) -> str:
         """
-        Submit vectorization as a background job using the embed_source command.
+        通过 embed_source 命令把向量化提交为后台任务。
 
-        This method leverages the job-based architecture to prevent HTTP connection
-        pool exhaustion when processing large documents. The embed_source command:
-        1. Detects content type from file path
-        2. Chunks text using content-type aware splitter
-        3. Generates all embeddings in batches
-        4. Bulk inserts source_embedding records
+        这里不在当前协程里直接做 embedding，而是复用命令任务架构，把真正的重活交给
+        embed_source 后台命令。这样做的直接目的，是避免大文档处理时在请求链路里长时间
+        占用连接与资源。根据 embed_source_command 的实现，后台任务会继续完成：
+        1. 根据文件路径推断内容类型
+        2. 使用与内容类型匹配的切分器切块
+        3. 分批生成所有 chunk 的 embedding
+        4. 批量写入 source_embedding 记录
 
         Returns:
-            str: The command/job ID that can be used to track progress via the commands API
+            str: 返回命令 / 任务 ID，调用方可以用它通过 commands API 跟踪进度
 
         Raises:
-            ValueError: If source has no text to vectorize
-            DatabaseOperationError: If job submission fails
+            ValueError: 当 source 没有可向量化的文本时抛出
+            DatabaseOperationError: 当后台任务提交失败时抛出
         """
+        # 先记录一条“准备提交任务”的日志。
+        # 这里记录的是 source.id，而不是更大的对象内容，原因是提交任务时真正稳定的定位信息
+        # 只有 source_id；后续无论排查日志还是跟踪命令，都要靠这个 id 对上同一条 source。
         logger.info(f"Submitting embed_source job for source {self.id}")
 
         try:
+            # 在提交后台任务前，先在领域层守住“必须有非空文本”这个前提。
+            # 这样做有两个直接理由：
+            # 1. vectorize() 的语义本身就是“为文本建立向量索引”，空文本没有可处理对象；
+            # 2. embed_source_command 里也会再次检查 source.full_text，当前方法先失败可以让
+            #    调用方更早得到明确错误，而不是把无效任务排进后台队列后再失败。
             if not self.full_text or not self.full_text.strip():
                 raise ValueError(f"Source {self.id} has no text to vectorize")
 
-            # Submit the embed_source command
+            # 这里只提交命令，不在当前方法里直接生成 embeddings。
+            # 从测试和实现都能确认：submit_command() 接收 app 名、命令名和 source_id，
+            # 返回的是 command_id；真正的切块、批量 embedding、写 source_embedding
+            # 都发生在 commands/embedding_commands.py 的 embed_source_command 里。
             command_id = submit_command(
                 "open_notebook",
                 "embed_source",
                 {"source_id": str(self.id)},
             )
 
+            # 把返回值显式转成 str，是为了让这个方法的返回类型和对外约定保持一致。
+            # submit_command() 的底层返回对象不在当前文件里声明为纯字符串，
+            # 这里统一转成 str 后，调用方就可以稳定地把它当 command_id 使用。
             command_id_str = str(command_id)
+
+            # 再记录一条“提交成功”的日志，并把 command_id 带出来。
+            # 这样后续如果要通过 commands API 查状态，日志里已经有完整的 source_id 和
+            # command_id 对应关系，不需要再额外复盘调用现场。
             logger.info(
                 f"Embed source job submitted for source {self.id}: "
                 f"command_id={command_id_str}"
             )
 
+            # 返回 command_id，而不是等待任务完成。
+            # 这和本方法“只负责任务提交”的设计一致，也和 API 层“提交后可跟踪进度”的用法一致。
             return command_id_str
 
         except ValueError:
+            # 业务前置条件错误原样抛出，不包一层 DatabaseOperationError。
+            # 这样调用方能区分“source 本身不满足向量化条件”和“提交后台任务时发生系统错误”。
             raise
         except Exception as e:
+            # 其余异常统一视为“任务提交失败”并转换成 DatabaseOperationError。
+            # 这样对外暴露的错误边界更清晰：调用方只需要把这类错误当作基础设施/持久化/
+            # 命令系统层面的失败处理。
             logger.error(
                 f"Failed to submit embed_source job for source {self.id}: {e}"
             )
